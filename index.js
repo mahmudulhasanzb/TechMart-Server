@@ -577,6 +577,60 @@ app.get('/api/reports/summary', requireRole(['manager', 'admin']), async (req, r
   }
 });
 
+// GET /api/users — Retrieve all users (Admin only)
+app.get('/api/users', requireRole(['admin']), async (req, res) => {
+  try {
+    const currentDb = getDb();
+    const users = await currentDb.collection('user').find({}).sort({ name: 1 }).toArray();
+    res.status(200).json({ data: users });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PATCH /api/users/:id/role — Update a user's role (Admin only)
+app.patch('/api/users/:id/role', requireRole(['admin']), async (req, res) => {
+  try {
+    const currentDb = getDb();
+    const { role } = req.body;
+    const allowedRoles = ['customer', 'staff', 'manager', 'admin'];
+    if (!role || !allowedRoles.includes(role)) {
+      return res.status(400).json({ error: 'Invalid or missing role' });
+    }
+
+    const targetUserId = req.params.id;
+
+    // Prevent locking oneself out
+    if (targetUserId === req.user._id.toString()) {
+      return res.status(400).json({ error: 'Admins cannot change their own role.' });
+    }
+
+    // Try finding by string ID first, then ObjectId
+    let query = { _id: targetUserId };
+    let user = await currentDb.collection('user').findOne(query);
+    if (!user) {
+      try {
+        query = { _id: new ObjectId(targetUserId) };
+        user = await currentDb.collection('user').findOne(query);
+      } catch (e) {
+        // ignore format error
+      }
+    }
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    await currentDb.collection('user').updateOne(query, {
+      $set: { role, updatedAt: new Date() }
+    });
+
+    res.status(200).json({ data: { message: 'User role updated successfully' } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- Server Startup ---
 async function startServer() {
   await connectDB();
