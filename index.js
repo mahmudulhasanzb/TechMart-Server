@@ -507,6 +507,76 @@ app.patch('/api/orders/:id', requireRole(['staff', 'manager', 'admin']), async (
   }
 });
 
+// GET /api/reports/summary — Analytics reports summary (Manager/Admin)
+app.get('/api/reports/summary', requireRole(['manager', 'admin']), async (req, res) => {
+  try {
+    const currentDb = getDb();
+
+    // 1. Total Revenue (sum of totalAmount for non-cancelled orders)
+    const revenueResult = await currentDb.collection('orders').aggregate([
+      { $match: { status: { $ne: 'cancelled' } } },
+      { $group: { _id: null, total: { $sum: "$totalAmount" } } }
+    ]).toArray();
+    const totalRevenue = revenueResult[0]?.total || 0;
+
+    // 2. Total Orders
+    const totalOrders = await currentDb.collection('orders').countDocuments({});
+
+    // 3. Active Shipments (shipped or processing)
+    const activeShipments = await currentDb.collection('orders').countDocuments({
+      status: { $in: ['processing', 'shipped'] }
+    });
+
+    // 4. Low Stock Items count
+    const lowStockCount = await currentDb.collection('products').countDocuments({
+      stock: { $lt: 5 }
+    });
+
+    // 5. Daily Sales Trend (last 7 days)
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const dailyRevenueResult = await currentDb.collection('orders').aggregate([
+      { $match: { status: { $ne: 'cancelled' }, createdAt: { $gte: sevenDaysAgo } } },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+          revenue: { $sum: "$totalAmount" },
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]).toArray();
+
+    // 6. Category Performance
+    const categoryRevenueResult = await currentDb.collection('orders').aggregate([
+      { $match: { status: { $ne: 'cancelled' } } },
+      { $unwind: "$items" },
+      {
+        $group: {
+          _id: "$items.category",
+          revenue: { $sum: { $multiply: ["$items.price", "$items.quantity"] } },
+          quantity: { $sum: "$items.quantity" }
+        }
+      },
+      { $sort: { revenue: -1 } }
+    ]).toArray();
+
+    res.status(200).json({
+      data: {
+        totalRevenue,
+        totalOrders,
+        activeShipments,
+        lowStockCount,
+        dailyRevenue: dailyRevenueResult,
+        categoryRevenue: categoryRevenueResult
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- Server Startup ---
 async function startServer() {
   await connectDB();
