@@ -447,6 +447,66 @@ app.get('/api/orders/:id', async (req, res) => {
   }
 });
 
+// GET /api/orders — Retrieve all orders (Staff/Manager/Admin)
+app.get('/api/orders', requireRole(['staff', 'manager', 'admin']), async (req, res) => {
+  try {
+    const currentDb = getDb();
+    const orders = await currentDb.collection('orders').find({}).sort({ createdAt: -1 }).toArray();
+    res.status(200).json({ data: orders });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PATCH /api/orders/:id — Update order status (Staff/Manager/Admin)
+app.patch('/api/orders/:id', requireRole(['staff', 'manager', 'admin']), async (req, res) => {
+  try {
+    const currentDb = getDb();
+    let orderId;
+    try {
+      orderId = new ObjectId(req.params.id);
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid order ID format' });
+    }
+
+    const { status } = req.body;
+    const allowedStatuses = ['pending', 'processing', 'shipped', 'delivered', 'cancelled'];
+    if (!status || !allowedStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Invalid or missing status' });
+    }
+
+    const order = await currentDb.collection('orders').findOne({ _id: orderId });
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    // Prevent modifying already cancelled orders
+    if (order.status === 'cancelled') {
+      return res.status(400).json({ error: 'Cannot update status of a cancelled order.' });
+    }
+
+    // Task 7.3: Stock restoral logic on order cancellation
+    if (status === 'cancelled' && order.status !== 'cancelled') {
+      for (const item of order.items) {
+        await currentDb.collection('products').updateOne(
+          { _id: new ObjectId(item.productId) },
+          { $inc: { stock: parseInt(item.quantity, 10) }, $set: { updatedAt: new Date() } }
+        );
+      }
+    }
+
+    const result = await currentDb.collection('orders').findOneAndUpdate(
+      { _id: orderId },
+      { $set: { status, updatedAt: new Date() } },
+      { returnDocument: 'after' }
+    );
+
+    res.status(200).json({ data: result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- Server Startup ---
 async function startServer() {
   await connectDB();
