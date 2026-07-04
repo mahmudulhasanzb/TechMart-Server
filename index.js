@@ -259,6 +259,194 @@ app.delete('/api/products/:id', requireRole(['staff', 'manager', 'admin']), asyn
   }
 });
 
+// --- Orders Routes ---
+
+// POST /api/orders — Create a new order
+app.post('/api/orders', async (req, res) => {
+  try {
+    const user = await getAuthUser(req);
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized. Please sign in.' });
+    }
+
+    const { items, shippingAddress, paymentMethod } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Cart is empty or invalid.' });
+    }
+
+    if (
+      !shippingAddress || 
+      !shippingAddress.fullName || 
+      !shippingAddress.street || 
+      !shippingAddress.city || 
+      !shippingAddress.state || 
+      !shippingAddress.zipCode || 
+      !shippingAddress.country || 
+      !shippingAddress.phoneNumber
+    ) {
+      return res.status(400).json({ error: 'Missing shipping address details.' });
+    }
+
+    if (!paymentMethod || !['cod', 'credit_card'].includes(paymentMethod)) {
+      return res.status(400).json({ error: 'Invalid or missing payment method.' });
+    }
+
+    const currentDb = getDb();
+    
+    // 1. Fetch current details of products and check stock
+    const productIds = items.map(item => {
+      try {
+        return new ObjectId(item.productId);
+      } catch (e) {
+        throw new Error(`Invalid product ID format: ${item.productId}`);
+      }
+    });
+
+    const products = await currentDb.collection('products').find({
+      _id: { $in: productIds }
+    }).toArray();
+
+    const productMap = products.reduce((acc, p) => {
+      acc[p._id.toString()] = p;
+      return acc;
+    }, {});
+
+    // Validate all items exist and have sufficient stock
+    for (const item of items) {
+      const dbProduct = productMap[item.productId];
+      if (!dbProduct) {
+        return res.status(404).json({ error: `Product not found: ${item.name}` });
+      }
+      if (dbProduct.stock < item.quantity) {
+        return res.status(400).json({
+          error: `Insufficient stock for ${dbProduct.name}. Only ${dbProduct.stock} units available.`
+        });
+      }
+    }
+
+    // 2. Perform atomic decrements with rollback mechanism
+    const updatedProducts = [];
+    let updateFailed = false;
+    let failedItemName = '';
+
+    for (const item of items) {
+      const dbProduct = productMap[item.productId];
+      const result = await currentDb.collection('products').updateOne(
+        { _id: dbProduct._id, stock: { $gte: item.quantity } },
+        { $inc: { stock: -item.quantity }, $set: { updatedAt: new Date() } }
+      );
+
+      if (result.matchedCount === 0) {
+        updateFailed = true;
+        failedItemName = dbProduct.name;
+        break;
+      } else {
+        updatedProducts.push({
+          productId: dbProduct._id,
+          quantity: item.quantity
+        });
+      }
+    }
+
+    // Rollback if any product stock update failed
+    if (updateFailed) {
+      for (const updated of updatedProducts) {
+        await currentDb.collection('products').updateOne(
+          { _id: updated.productId },
+          { $inc: { stock: updated.quantity }, $set: { updatedAt: new Date() } }
+        );
+      }
+      return res.status(400).json({
+        error: `Order processing failed. Stock for "${failedItemName}" was taken by another order. Please try again.`
+      });
+    }
+
+    // 3. Build order items with database prices (security measure)
+    const orderItems = items.map(item => {
+      const dbProduct = productMap[item.productId];
+      return {
+        productId: dbProduct._id,
+        name: dbProduct.name,
+        price: dbProduct.price,
+        quantity: item.quantity,
+        category: dbProduct.category,
+        image: dbProduct.images?.[0] || ''
+      };
+    });
+
+    const totalAmount = orderItems.reduce((sum, item) => sum + item.price * item.quantity, 0);
+
+    // Create the order document
+    const newOrder = {
+      customerId: user._id.toString(),
+      customerName: user.name,
+      customerEmail: user.email,
+      items: orderItems,
+      totalAmount,
+      status: 'pending',
+      shippingAddress: {
+        fullName: shippingAddress.fullName,
+        street: shippingAddress.street,
+        city: shippingAddress.city,
+        state: shippingAddress.state,
+        zipCode: shippingAddress.zipCode,
+        country: shippingAddress.country,
+        phoneNumber: shippingAddress.phoneNumber
+      },
+      payment: {
+        method: paymentMethod,
+        status: paymentMethod === 'credit_card' ? 'paid' : 'pending'
+      },
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const orderResult = await currentDb.collection('orders').insertOne(newOrder);
+    res.status(201).json({
+      data: {
+        id: orderResult.insertedId.toString(),
+        ...newOrder
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/orders/:id — Retrieve order details by ID
+app.get('/api/orders/:id', async (req, res) => {
+  try {
+    const user = await getAuthUser(req);
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized. Please sign in.' });
+    }
+
+    const currentDb = getDb();
+    let orderId;
+    try {
+      orderId = new ObjectId(req.params.id);
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid order ID format' });
+    }
+
+    const order = await currentDb.collection('orders').findOne({ _id: orderId });
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    // Security: Only allow the customer who placed the order or staff/manager/admin to view it
+    const isCustomer = user.role === 'customer' || !user.role;
+    if (isCustomer && order.customerId !== user._id.toString()) {
+      return res.status(403).json({ error: 'Forbidden. You do not have permission to view this order.' });
+    }
+
+    res.status(200).json({ data: order });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- Server Startup ---
 async function startServer() {
   await connectDB();
